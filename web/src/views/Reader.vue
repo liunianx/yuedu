@@ -1477,49 +1477,57 @@ export default {
         });
       });
     },
-    saveBookProgress(force) {
+    saveBookProgress(force, position) {
       if (!force && !this.startSavePosition) {
         return Promise.resolve();
       }
+      // 优先使用传入的位置参数，其次使用缓存的计算位置，最后用滚动位置
       let pos = 0;
-      if (this.isAudio) {
+      if (typeof position === 'number' && position > 0) {
+        pos = position;
+      } else if (this._lastCalculatedPosition > 0) {
+        pos = this._lastCalculatedPosition;
+      } else if (this.isAudio) {
         pos = this.$refs.bookContentRef
           ? Math.floor(this.$refs.bookContentRef.currentTime || 0)
           : 0;
       } else if (this.isEpub || this.isCarToon) {
-        pos =
-          document.documentElement.scrollTop || document.body.scrollTop || 0;
-      } else if (this.currentParagraph) {
-        let currentChapter = this.currentParagraph;
-        while (
-          currentChapter &&
-          currentChapter.className &&
-          currentChapter.className.indexOf &&
-          currentChapter.className.indexOf("chapter-content") < 0
-        ) {
-          currentChapter = currentChapter.parentNode;
-          if (currentChapter === this.$refs.bookContentRef.$el) {
-            break;
-          }
-        }
-        if (
-          currentChapter &&
-          currentChapter.querySelectorAll
-        ) {
-          const chapterContentPos =
-            currentChapter.innerText.indexOf(
-              this.currentParagraph.innerText
-            ) || 0;
-          const paragraphs = currentChapter.querySelectorAll("h3,p");
-          for (let i = 0; i < paragraphs.length; i++) {
-            const paragraph = paragraphs[i];
-            if (paragraph === this.currentParagraph) {
-              pos =
-                typeof paragraph.dataset.pos !== "undefined"
-                  ? +paragraph.dataset.pos
-                  : chapterContentPos;
-              break;
+        pos = document.documentElement.scrollTop || document.body.scrollTop || 0;
+      } else {
+        // 通用后备：使用滚动位置（可靠，适用于所有浏览器）
+        pos = document.documentElement.scrollTop || document.body.scrollTop || 0;
+        // 尝试段落检测以获得更精确的位置
+        if (this.currentParagraph) {
+          try {
+            let currentChapter = this.currentParagraph;
+            while (
+              currentChapter &&
+              currentChapter.className &&
+              currentChapter.className.indexOf &&
+              currentChapter.className.indexOf("chapter-content") < 0
+            ) {
+              currentChapter = currentChapter.parentNode;
+              if (currentChapter === this.$refs.bookContentRef.$el) {
+                break;
+              }
             }
+            if (currentChapter && currentChapter.querySelectorAll) {
+              const paragraphs = currentChapter.querySelectorAll("h3,p");
+              for (let i = 0; i < paragraphs.length; i++) {
+                const paragraph = paragraphs[i];
+                if (paragraph === this.currentParagraph) {
+                  const paraPos = typeof paragraph.dataset.pos !== "undefined"
+                    ? +paragraph.dataset.pos
+                    : 0;
+                  if (paraPos > 0) {
+                    pos = paraPos;
+                  }
+                  break;
+                }
+              }
+            }
+          } catch (e) {
+            // 段落检测失败，保持滚动位置
           }
         }
       }
@@ -1527,7 +1535,9 @@ export default {
         url: this.$store.getters.readingBook.bookUrl,
         index: this.chapterIndex
       };
-      payload.pos = pos || 0;
+      if (pos > 0) {
+        payload.pos = pos;
+      }
       return Axios.post(this.api + "/saveBookProgress", payload, {
         silent: true
       }).catch(() => {});
@@ -2584,6 +2594,7 @@ export default {
         }
         let position = 0;
         let shouldSyncToServer = false;
+        let posSource = 'init';
         if (this.isAudio) {
           position = this.$refs.bookContentRef
             ? this.$refs.bookContentRef.currentTime
@@ -2591,6 +2602,7 @@ export default {
         } else if (this.isEpub || this.isCarToon) {
           position =
             document.documentElement.scrollTop || document.body.scrollTop;
+          posSource = 'scroll';
         } else {
           // 更新当前章节 和 当前段落
           if (this.preCaching) {
@@ -2629,6 +2641,7 @@ export default {
                   : currentChapter.innerText.indexOf(
                       this.currentParagraph.innerText
                     );
+              posSource = 'paragraph';
               // 段落位置变化超过 500 字符时，同步到服务器
               const lastSyncedPos = this._lastSyncedPos || 0;
               if (Math.abs(position - lastSyncedPos) > 500) {
@@ -2636,7 +2649,18 @@ export default {
               }
             }
           }
+          // 如果段落检测失败，使用滚动位置作为可靠后备
+          if (position === 0) {
+            position = document.documentElement.scrollTop || document.body.scrollTop || 0;
+            posSource = 'scroll-fallback';
+            const lastSyncedPos2 = this._lastSyncedPos || 0;
+            if (Math.abs(position - lastSyncedPos2) > 100) {
+              shouldSyncToServer = true;
+            }
+          }
         }
+        // Store position for saveBookProgress to reuse
+        this._lastCalculatedPosition = position;
         setCache(
           "bookChapterProgress@" +
             this.$store.getters.readingBook.name +
@@ -2649,7 +2673,7 @@ export default {
           this._lastSyncedPos = position;
           clearTimeout(this._syncProgressTimer);
           this._syncProgressTimer = setTimeout(() => {
-            this.saveBookProgress();
+            this.saveBookProgress(false, position);
           }, 2000);
         }
       } catch (error) {
@@ -2727,28 +2751,31 @@ export default {
               this.getContent(serverChapterIndex);
               this.$once("showContent", () => {
                 const pos = serverChapterPos != null ? serverChapterPos : localPosition;
-                if (pos != null && pos !== 0) {
+                if (pos != null && pos > 0) {
                   this.$nextTick(() => {
                     this.showPosition(+pos, () => {
                       this.startSavePosition = true;
+                      this._lastCalculatedPosition = +pos;
                     });
                   });
                 } else {
-                  // 切换章节后即使 pos=0 也要启用保存
                   this.startSavePosition = true;
                 }
               });
               return;
             }
 
-            // 同章节：直接定位段落（serverChapterPos 包括 0 都是有效值）
-            if (serverChapterPos != null) {
+            // 同章节：优先使用服务器位置
+            if (serverChapterPos != null && serverChapterPos > 0) {
               setCache(cacheKey, serverChapterPos);
               applyPosition(serverChapterPos);
               return;
             }
 
-            applyPosition(localPosition);
+            if (localPosition && +localPosition > 0) {
+              applyPosition(localPosition);
+              return;
+            }
           })
           .catch(() => {
             applyPosition(localPosition);
